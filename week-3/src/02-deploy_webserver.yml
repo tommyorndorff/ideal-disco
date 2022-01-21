@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'AWS CloudFormation Sample Template AutoScalingMultiAZWithNotifications: Create a multi-az, load balanced and Auto Scaled sample web site running on an Apache Web Serever. The application is configured to span all Availability Zones in the region and is Auto-Scaled based on the CPU utilization of the web servers. Notifications will be sent to the operator email address on scaling events. The instances are load balanced with a simple health check against the default web page. **WARNING** This template creates one or more Amazon EC2 instances and an Application Load Balancer. You will be billed for the AWS resources used if you create a stack from this template.'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VpcId of your existing Virtual Private Cloud (VPC)
+    ConstraintDescription: must be the VPC Id of an existing Virtual Private Cloud.
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The list of SubnetIds in your Virtual Private Cloud (VPC)
+    ConstraintDescription: must be a list of at least two existing subnets associated with at least two different availability zones. They should be residing in the selected Virtual Private Cloud.
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  OperatorEMail:
+    Description: EMail address to notify if there are any scaling operations
+    Type: String
+    AllowedPattern: ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    Default: torndorff@expediagroup.com
+    ConstraintDescription: must be a valid email address.
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: 10.0.0.0/8
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+Mappings:
+  Region2Examples:
+    us-east-1:
+      Examples: https://s3.amazonaws.com/cloudformation-examples-us-east-1
+    us-east-2:
+      Examples: https://s3-us-east-2.amazonaws.com/cloudformation-examples-us-east-2
+    us-west-2:
+      Examples: https://s3-us-west-2.amazonaws.com/cloudformation-examples-us-west-2
+  AWSInstanceType2Arch:
+    t1.micro:
+      Arch: HVM64
+    t2.nano:
+      Arch: HVM64
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+    t2.large:
+      Arch: HVM64
+  AWSRegionArch2AMI:
+    us-east-1:
+      HVM64: ami-083602cee93914c0c # switched this one to amazon linux 2
+      HVMG2: ami-0aeb704d503081ea6
+    us-east-2:
+      HVM64: ami-027cab9a7bf0155df
+      HVMG2: NOT_SUPPORTED
+    us-west-1:
+      HVM64: ami-088c153f74339f34c
+      HVMG2: ami-0a7fc72dc0e51aa77
+    us-west-2:
+      HVM64: ami-01fee56b22f308154
+      HVMG2: ami-0fe84a5b4563d8f27
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint:
+            Ref: OperatorEMail
+          Protocol: email
+  WebServerGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        Ref: Subnets
+      LaunchConfigurationName:
+        Ref: LaunchConfig
+      MinSize: "1"
+      MaxSize: "3"
+      TargetGroupARNs:
+        - Ref: ALBTargetGroup
+        - Ref: ALBTargetGroup8080
+      NotificationConfiguration:
+        TopicARN:
+          Ref: NotificationTopic
+        NotificationTypes:
+          - autoscaling:EC2_INSTANCE_LAUNCH
+          - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+          - autoscaling:EC2_INSTANCE_TERMINATE
+          - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: "1"
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: "1"
+        MaxBatchSize: "1"
+        PauseTime: PT15M
+        WaitOnResourceSignals: "true"
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Install a basic webpage with static content
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+              golang: []
+          files:
+            /var/www/html/index.html:
+              content: !Sub |
+                <h2>yay from cloudformation stack ${AWS::StackName}</h2>
+              mode: "000644"
+              owner: root
+              group: root
+            /home/ec2-user/peak_cpu.go:
+              content: !Sub |
+                package main
+
+                import (
+                  "runtime"
+                  "time"
+                  "math/rand"
+                  "fmt"
+                )
+
+                func main() {
+                  done := make(chan int)
+
+                  s := rand.Intn(300)
+                  fmt.Printf("Sleeping %d seconds before CPU spike...\n", s)
+                  time.Sleep(time.Duration(s)*time.Second)
+
+                  for i := 0; i < runtime.NumCPU(); i++ {
+                    go func() {
+                      for {
+                        select {
+                        case <-done:
+                          return
+                        default:
+                        }
+                      }
+                    }()
+                  }
+
+                  rand.Seed(time.Now().UnixNano())
+                  n := rand.Intn(300)
+                  fmt.Printf("Allowing %d seconds of CPU spike\n", n)
+                  time.Sleep(time.Duration(n)*time.Second)
+                  close(done)
+                }
+              mode: "000644"
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/httpd.go:
+              content: !Sub |
+                package main
+
+                import (
+                  "fmt"
+                  "net/http"
+                  "strconv"
+
+                  "math/big"
+
+                  "github.com/gorilla/mux"
+                )
+
+                func arccot(x int64, unity *big.Int) *big.Int {
+                  bigx := big.NewInt(x)
+                  xsquared := big.NewInt(x * x)
+                  sum := big.NewInt(0)
+                  sum.Div(unity, bigx)
+                  xpower := big.NewInt(0)
+                  xpower.Set(sum)
+                  n := int64(3)
+                  zero := big.NewInt(0)
+                  sign := false
+
+                  term := big.NewInt(0)
+                  for {
+                    xpower.Div(xpower, xsquared)
+                    term.Div(xpower, big.NewInt(n))
+                    if term.Cmp(zero) == 0 {
+                      break
+                    }
+                    if sign {
+                      sum.Add(sum, term)
+                    } else {
+                      sum.Sub(sum, term)
+                    }
+                    sign = !sign
+                    n += 2
+                  }
+                  return sum
+                }
+
+                func Pi(w http.ResponseWriter, r *http.Request) {
+                  vars := mux.Vars(r)
+                  length, ok := vars["length"]
+                  if !ok {
+                    length = "1"
+                  }
+                  i, err := strconv.ParseInt(length, 10, 64)
+                  if err != nil {
+                    http.Error(w, err.Error(), http.StatusBadRequest)
+                    return
+                  }
+
+                  digits := big.NewInt(i + 10)
+                  unity := big.NewInt(0)
+                  unity.Exp(big.NewInt(10), digits, nil)
+                  pi := big.NewInt(0)
+                  four := big.NewInt(4)
+                  pi.Mul(four, pi.Sub(pi.Mul(four, arccot(5, unity)), arccot(239, unity)))
+                  //val := big.Mul(4, big.Sub(big.Mul(4, arccot(5, unity)), arccot(239, unity)))
+                  fmt.Println("Hello, Pi:  ", pi)
+                  fmt.Fprintf(w, "pi is: %d\n", pi)
+                }
+
+                func main() {
+                  r := mux.NewRouter()
+                  r.HandleFunc("/pi/{length}", Pi)
+
+                  http.ListenAndServe(":8080", r)
+                }
+
+              mode: "000644"
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/httpd.sh:
+              content: !Sub |
+                #!/bin/bash -xe
+                go get github.com/gorilla/mux
+                go run ~/httpd.go
+              mode: "000744"
+              owner: ec2-user
+              group: ec2-user
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfig --region ${AWS::Region}
+                runas=root
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: "true"
+                ensureRunning: "true"
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      KeyName:
+        Ref: KeyName
+      ImageId:
+        Fn::FindInMap:
+          - AWSRegionArch2AMI
+          - Ref: AWS::Region
+          - Fn::FindInMap:
+              - AWSInstanceType2Arch
+              - Ref: InstanceType
+              - Arch
+      SecurityGroups:
+        - Ref: InstanceSecurityGroup
+      InstanceType:
+        Ref: InstanceType
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y aws-cfn-bootstrap
+          yum update -y aws-cli
+          echo -e "*/1 * * * * /home/ec2-user/httpd.sh " | crontab -u ec2-user -
+          /opt/aws/bin/cfn-init -v --stack torndorff-webserver --resource LaunchConfig --region us-east-1
+          /opt/aws/bin/cfn-signal -e $? --stack torndorff-webserver --resource WebServerGroup --region us-east-1
+  WebServerScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroup
+      Cooldown: "60"
+      ScalingAdjustment: "1"
+  WebServerScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroup
+      Cooldown: "60"
+      ScalingAdjustment: "-1"
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 50% for 120 seconds
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: "60"
+      EvaluationPeriods: "2"
+      Threshold: "50"
+      AlarmActions:
+        - Ref: WebServerScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Ref: WebServerGroup
+      ComparisonOperator: GreaterThanThreshold
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 30% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: "60"
+      EvaluationPeriods: "5"
+      Threshold: "30"
+      AlarmActions:
+        - Ref: WebServerScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Ref: WebServerGroup
+      ComparisonOperator: LessThanThreshold
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        Ref: Subnets
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: ALBTargetGroup
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: "80"
+      Protocol: HTTP
+  ALBListener8080:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: ALBTargetGroup8080
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: "8080"
+      Protocol: HTTP
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Ref: VpcId
+  ALBTargetGroup8080:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      Port: 8080
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Ref: VpcId
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access and HTTP from the load balancer only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp:
+            Ref: SSHLocation
+        - IpProtocol: tcp
+          FromPort: "80"
+          ToPort: "80"
+          SourceSecurityGroupId:
+            Fn::Select:
+              - 0
+              - Fn::GetAtt:
+                  - ApplicationLoadBalancer
+                  - SecurityGroups
+        - IpProtocol: tcp
+          FromPort: "8080"
+          ToPort: "8080"
+          SourceSecurityGroupId:
+            Fn::Select:
+              - 0
+              - Fn::GetAtt:
+                  - ApplicationLoadBalancer
+                  - SecurityGroups
+      VpcId:
+        Ref: VpcId
+Outputs:
+  URL:
+    Description: The URL of the website
+    Value:
+      Fn::Join:
+        - ""
+        - - http://
+          - Fn::GetAtt:
+              - ApplicationLoadBalancer
+              - DNSName
